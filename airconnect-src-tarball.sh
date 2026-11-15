@@ -39,6 +39,59 @@ git_clone() {
     return 1
 }
 
+git_fetch_commit() {
+    _dest="$1"
+    _url="$2"
+    _commit="$3"
+    _keep_git="$4"
+    shift 4
+
+    mkdir -p "$_dest"
+    (
+        cd "$_dest"
+        git init -q
+        git remote add origin "$_url"
+        if [ "$#" -gt 0 ]; then
+            git config core.sparseCheckout true
+            git sparse-checkout init --no-cone
+            git sparse-checkout set "$@"
+            _fetch_cmd="git fetch --depth 1 --filter=blob:none origin $_commit"
+        else
+            _fetch_cmd="git fetch --depth 1 origin $_commit"
+        fi
+
+        _retries=3
+        while [ "$_retries" -gt 0 ]; do
+            if eval "$_fetch_cmd"; then
+                break
+            fi
+            _retries=$((_retries - 1))
+            echo "Git fetch failed, retrying in 2s ($_retries left)..." >&2
+            sleep 2
+        done
+        if [ "$_retries" -eq 0 ]; then
+            echo "ERROR: Failed to fetch $_commit from $_url" >&2
+            exit 1
+        fi
+
+        git checkout -q FETCH_HEAD
+        if [ "$_keep_git" -ne 1 ]; then
+            rm -rf .git
+        fi
+    )
+}
+
+get_submodule_commit() {
+    _tree="$1"
+    _path="$2"
+    _commit="$(git -C "$_tree" ls-tree HEAD "$_path" 2>/dev/null | awk '{print $3}')"
+    if [ -z "$_commit" ]; then
+        echo "ERROR: Could not resolve submodule commit for $_path" >&2
+        exit 1
+    fi
+    echo "$_commit"
+}
+
 echo "==> Fetching AirConnect ($VERSION)..."
 git_clone --depth 1 --filter=blob:none --branch "$VERSION" --no-checkout \
     https://github.com/philippe44/AirConnect.git "$ROOTDIR"
@@ -50,28 +103,29 @@ git_clone --depth 1 --filter=blob:none --branch "$VERSION" --no-checkout \
     git checkout "$VERSION"
 )
 MTIME="$(git -C "$ROOTDIR" log -1 --format=%ct "$VERSION" 2>/dev/null || echo 1727373960)"
+
+echo "==> Resolving pinned submodule commits from AirConnect ($VERSION)..."
+COMMIT_CROSSTOOLS="$(get_submodule_commit "$ROOTDIR" common/crosstools)"
+COMMIT_DMAP="$(get_submodule_commit "$ROOTDIR" common/dmap-parser)"
+COMMIT_CODECS="$(get_submodule_commit "$ROOTDIR" common/libcodecs)"
+COMMIT_MDNS="$(get_submodule_commit "$ROOTDIR" common/libmdns)"
+COMMIT_PUPNP="$(get_submodule_commit "$ROOTDIR" common/libpupnp)"
+COMMIT_RAOP="$(get_submodule_commit "$ROOTDIR" common/libraop)"
+COMMIT_NANOPB="$(get_submodule_commit "$ROOTDIR" aircast/nanopb)"
+
 rm -rf "$ROOTDIR/.git"
 
-echo "==> Fetching submodules..."
+echo "==> Fetching submodules at pinned commits..."
 
 # crosstools
-git_clone --depth 1 https://github.com/philippe44/crosstools.git "$ROOTDIR/common/crosstools"
-rm -rf "$ROOTDIR/common/crosstools/.git"
+git_fetch_commit "$ROOTDIR/common/crosstools" "https://github.com/philippe44/crosstools.git" "$COMMIT_CROSSTOOLS" 0
 sed -i '/#include <sys\/poll.h>/d' "$ROOTDIR/common/crosstools/src/platform.h"
 
 # dmap-parser
-git_clone --depth 1 https://github.com/philippe44/dmap-parser.git "$ROOTDIR/common/dmap-parser"
-rm -rf "$ROOTDIR/common/dmap-parser/.git"
+git_fetch_commit "$ROOTDIR/common/dmap-parser" "https://github.com/philippe44/dmap-parser.git" "$COMMIT_DMAP" 0
 
 # libcodecs - NO_FAAC
-git_clone --depth 1 --filter=blob:none --no-checkout https://github.com/philippe44/libcodecs.git "$ROOTDIR/common/libcodecs"
-(
-    cd "$ROOTDIR/common/libcodecs"
-    git sparse-checkout init --no-cone
-    git sparse-checkout set '/*' '!/targets'
-    git checkout
-    rm -rf .git
-)
+git_fetch_commit "$ROOTDIR/common/libcodecs" "https://github.com/philippe44/libcodecs.git" "$COMMIT_CODECS" 0 '/*' '!/targets'
 patch -p1 -d "$ROOTDIR/common/libcodecs" << 'EOF'
 --- a/addons/encoder.c
 +++ b/addons/encoder.c
@@ -136,46 +190,26 @@ patch -p1 -d "$ROOTDIR/common/libcodecs" << 'EOF'
 EOF
 
 # libmdns
-git_clone --depth 1 --filter=blob:none --no-checkout https://github.com/philippe44/libmdns.git "$ROOTDIR/common/libmdns"
-(
-    cd "$ROOTDIR/common/libmdns"
-    git sparse-checkout init --no-cone
-    git sparse-checkout set '/*' '!/targets' '!/bin'
-    git checkout
-    rm -rf .git
-)
-git_clone --depth 1 https://github.com/philippe44/mdnssd.git "$ROOTDIR/common/libmdns/mdnssd"
-rm -rf "$ROOTDIR/common/libmdns/mdnssd/.git" "$ROOTDIR/common/libmdns/mdnssd/bin"
+git_fetch_commit "$ROOTDIR/common/libmdns" "https://github.com/philippe44/libmdns.git" "$COMMIT_MDNS" 1 '/*' '!/targets' '!/bin'
+COMMIT_MDNSSD="$(get_submodule_commit "$ROOTDIR/common/libmdns" mdnssd)"
+COMMIT_MDNSSVC="$(get_submodule_commit "$ROOTDIR/common/libmdns" mdnssvc)"
+rm -rf "$ROOTDIR/common/libmdns/.git"
 
-git_clone --depth 1 https://github.com/philippe44/mdnssvc.git "$ROOTDIR/common/libmdns/mdnssvc"
-rm -rf "$ROOTDIR/common/libmdns/mdnssvc/.git" "$ROOTDIR/common/libmdns/mdnssvc/bin"
+git_fetch_commit "$ROOTDIR/common/libmdns/mdnssd" "https://github.com/philippe44/mdnssd.git" "$COMMIT_MDNSSD" 0 '/*' '!/bin'
+git_fetch_commit "$ROOTDIR/common/libmdns/mdnssvc" "https://github.com/philippe44/mdnssvc.git" "$COMMIT_MDNSSVC" 0 '/*' '!/bin'
 
 # libpupnp - upnpdebug.h
-git_clone --depth 1 --filter=blob:none --no-checkout https://github.com/philippe44/libpupnp.git "$ROOTDIR/common/libpupnp"
-(
-    cd "$ROOTDIR/common/libpupnp"
-    git sparse-checkout init --no-cone
-    git sparse-checkout set '/*' '!/targets/*' '/targets/linux/x86_64/include/upnp/upnpdebug.h'
-    git checkout
-    if [ -f targets/linux/x86_64/include/upnp/upnpdebug.h ]; then
-        cp targets/linux/x86_64/include/upnp/upnpdebug.h addons/upnpdebug.h
-    fi
-    rm -rf targets .git
-)
+git_fetch_commit "$ROOTDIR/common/libpupnp" "https://github.com/philippe44/libpupnp.git" "$COMMIT_PUPNP" 0 '/*' '!/targets/*' '/targets/linux/x86_64/include/upnp/upnpdebug.h'
+if [ -f "$ROOTDIR/common/libpupnp/targets/linux/x86_64/include/upnp/upnpdebug.h" ]; then
+    cp "$ROOTDIR/common/libpupnp/targets/linux/x86_64/include/upnp/upnpdebug.h" "$ROOTDIR/common/libpupnp/addons/upnpdebug.h"
+fi
+rm -rf "$ROOTDIR/common/libpupnp/targets"
 
 # libraop
-git_clone --depth 1 --filter=blob:none --no-checkout https://github.com/philippe44/libraop.git "$ROOTDIR/common/libraop"
-(
-    cd "$ROOTDIR/common/libraop"
-    git sparse-checkout init --no-cone
-    git sparse-checkout set '/*' '!/targets' '!/bin'
-    git checkout
-    rm -rf .git
-)
+git_fetch_commit "$ROOTDIR/common/libraop" "https://github.com/philippe44/libraop.git" "$COMMIT_RAOP" 0 '/*' '!/targets' '!/bin'
 
 # nanopb
-git_clone --depth 1 https://github.com/nanopb/nanopb.git "$ROOTDIR/aircast/nanopb"
-rm -rf "$ROOTDIR/aircast/nanopb/.git"
+git_fetch_commit "$ROOTDIR/aircast/nanopb" "https://github.com/nanopb/nanopb.git" "$COMMIT_NANOPB" 0
 
 # remove upstream build scripts and updater
 rm -f "$ROOTDIR"/build.cmd "$ROOTDIR"/build.sh "$ROOTDIR"/buildall.sh "$ROOTDIR"/updater
